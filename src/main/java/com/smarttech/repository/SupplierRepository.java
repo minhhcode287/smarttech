@@ -24,7 +24,7 @@ public class SupplierRepository {
     private final MongoCollection<Document> collection;
 
     public SupplierRepository() {
-        this.collection = MongoDBConnection.getInstance().getCollection("suppliers");
+        this.collection = MongoDBConnection.getDatabase().getCollection("suppliers");
         initDefaultSuppliersIfEmpty();
     }
 

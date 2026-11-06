@@ -1,513 +1,818 @@
 package com.smarttech.view.panel;
 
-import com.smarttech.model.Order;
-import com.smarttech.model.OrderItem;
-import com.smarttech.model.RentalContract;
-import com.smarttech.model.RentalItem;
-import com.smarttech.repository.OrderRepository;
-import com.smarttech.repository.RentalContractRepository;
+import com.smarttech.service.ReportService;
+import com.smarttech.service.ReportService.DailyRevenuePoint;
+import com.smarttech.service.ReportService.ReportTransaction;
+import com.smarttech.service.ReportService.RevenueReportData;
+import com.smarttech.service.ReportService.TopProductReport;
 import com.smarttech.view.util.UIUtils;
 
 import javax.swing.*;
+import javax.swing.border.CompoundBorder;
 import javax.swing.border.EmptyBorder;
+import javax.swing.border.LineBorder;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.JTableHeader;
 import java.awt.*;
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
-import java.nio.charset.StandardCharsets;
+import java.text.DecimalFormat;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.*;
 
 /**
- * Phân hệ Báo Cáo Thống Kê & Phân Tích Doanh Thu (ReportPanel).
- * Tích hợp tính toán thời gian thực theo 4 kỳ báo cáo, 4 thẻ KPI Summary Cards,
- * JTabbedPane chi tiết Đơn bán / Hợp đồng thuê, Top 5 Thiết bị chạy nhất
- * và chức năng Xuất báo cáo CSV chuẩn UTF-8 qua JFileChooser.
+ * Phân hệ Báo Cáo Thống Kê, Biểu Đồ Doanh Thu & Xuất Báo Cáo (Prompt 21 - Final Delivery).
+ * Kiến trúc Enterprise chuyên sâu:
+ * - 4 Stat Cards tổng hợp KPI: Doanh thu Bán hàng, Cho thuê, Chi phí, Lợi nhuận gộp.
+ * - Tab 1: Biểu đồ trực quan hóa doanh thu bằng Custom Swing Graphics 2D & Bảng Top 5 sản phẩm chạy nhất.
+ * - Tab 2: Bảng chi tiết toàn bộ giao dịch kế toán có thanh lọc và phân tích chênh lệch.
+ * - Xuất file CSV UTF-8 (BOM \uFEFF) tương thích 100% Microsoft Excel.
+ * - 100% thao tác tổng hợp dữ liệu chạy qua SwingWorker không gây nghẽn giao diện.
  *
- * @author Senior Java Developer & Software Architect
+ * @author Senior Java Developer & Software Architect (30 years ERP/POS experience)
  * @project SmartTech
  */
 public class ReportPanel extends JPanel {
 
-    private final OrderRepository orderRepository;
-    private final RentalContractRepository rentalContractRepository;
+    private static final DecimalFormat CURRENCY_FORMAT = new DecimalFormat("#,##0 VNĐ");
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final DateTimeFormatter DISPLAY_DATE_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
-    // Filter controls
-    private JComboBox<String> cboPeriod;
+    private final ReportService reportService;
+
+    // Filter Controls
+    private JComboBox<String> cboTimePreset;
+    private JTextField txtFromDate;
+    private JTextField txtToDate;
+    private JButton btnFilter;
+    private JButton btnExport;
     private JLabel lblLoadingStatus;
 
-    // 4 KPI Summary Cards
-    private JLabel lblTotalSaleRevenue;
-    private JLabel lblTotalRentalRevenue;
-    private JLabel lblActiveRentalCount;
-    private JLabel lblTotalDevicesProcessed;
+    // 4 Stat Cards KPI
+    private StatCard cardSales;
+    private StatCard cardRental;
+    private StatCard cardCosts;
+    private StatCard cardProfit;
 
-    // Tab 1: Chi tiết Bán hàng
-    private JTable saleReportTable;
-    private DefaultTableModel saleReportModel;
+    // Tab 1: Chart & Top 5
+    private RevenueChartPanel revenueChartPanel;
+    private JTable tblTopProducts;
+    private DefaultTableModel modelTopProducts;
 
-    // Tab 2: Chi tiết Cho thuê
-    private JTable rentalReportTable;
-    private DefaultTableModel rentalReportModel;
+    // Tab 2: Detail Table
+    private JTable tblDetails;
+    private DefaultTableModel modelDetails;
+    private JTextField txtSearchDetail;
 
-    // Tab 3: Top 5 Thiết bị thịnh hành
-    private JTable topDevicesTable;
-    private DefaultTableModel topDevicesModel;
-
-    // Cache kết quả thống kê
-    private double currentSaleRev = 0.0;
-    private double currentRentRev = 0.0;
-    private int currentActiveRentals = 0;
-    private int currentDevicesTotal = 0;
+    // Cache dữ liệu hiện tại để phục vụ xuất file
+    private RevenueReportData currentReportData;
+    private List<TopProductReport> currentTopProducts;
 
     public ReportPanel() {
-        this.orderRepository = new OrderRepository();
-        this.rentalContractRepository = new RentalContractRepository();
+        this.reportService = new ReportService();
 
         initComponents();
-        loadAnalyticsAsync();
+        setupDefaultDates();
+        loadReportDataAsync();
     }
 
     private void initComponents() {
         setLayout(new BorderLayout(0, 16));
         setBackground(UIUtils.COLOR_BG_LIGHT);
-        setBorder(new EmptyBorder(15, 15, 15, 15));
+        setBorder(new EmptyBorder(16, 16, 16, 16));
 
-        // ================= 1. HEADER & FILTER TOOLBAR =================
-        JPanel topContainer = new JPanel(new BorderLayout(0, 10));
-        topContainer.setOpaque(false);
+        // 1. TOP HEADER & FILTER BAR
+        JPanel topContainer = createHeaderAndFilterBar();
+        add(topContainer, BorderLayout.NORTH);
 
-        // Header Title
-        JPanel headerTitle = new JPanel(new BorderLayout());
-        headerTitle.setOpaque(false);
-        JLabel lblTitle = new JLabel("Báo Cáo Thống Kê & Doanh Thu (Analytics)");
+        // 2. CENTER WORKSPACE (Stat Cards + Tabs)
+        JPanel centerContainer = new JPanel(new BorderLayout(0, 16));
+        centerContainer.setOpaque(false);
+
+        // 4 Stat Cards KPI
+        JPanel statCardsPanel = createStatCardsPanel();
+        centerContainer.add(statCardsPanel, BorderLayout.NORTH);
+
+        // Tabbed Pane (Biểu Đồ & Bảng Số Liệu Chi Tiết)
+        JTabbedPane tabbedPane = new JTabbedPane();
+        tabbedPane.setFont(UIUtils.FONT_BODY_BOLD);
+        tabbedPane.setBackground(Color.WHITE);
+
+        // Tab 1: Biểu Đồ & Thống Kê Tổng Hợp
+        tabbedPane.addTab("📈  Biểu Đồ & Thống Kê Tổng Hợp", createChartAndTopPanel());
+
+        // Tab 2: Bảng Số Liệu Chi Tiết
+        tabbedPane.addTab("📋  Bảng Số Liệu Chi Tiết Đơn Hàng & Doanh Thu", createDetailTablePanel());
+
+        centerContainer.add(tabbedPane, BorderLayout.CENTER);
+        add(centerContainer, BorderLayout.CENTER);
+    }
+
+    /**
+     * Tạo phần Header thương hiệu và thanh công cụ bộ lọc thời gian.
+     */
+    private JPanel createHeaderAndFilterBar() {
+        JPanel container = new JPanel(new BorderLayout(0, 12));
+        container.setOpaque(false);
+
+        // Tiêu đề phân hệ
+        JPanel titlePanel = new JPanel(new BorderLayout());
+        titlePanel.setOpaque(false);
+
+        JLabel lblTitle = new JLabel("PHÂN HỆ BÁO CÁO THỐNG KÊ & PHÂN TÍCH DOANH THU");
         lblTitle.setFont(UIUtils.FONT_TITLE);
         lblTitle.setForeground(UIUtils.COLOR_TEXT_MAIN);
 
-        JLabel lblSub = new JLabel("Theo dõi cơ cấu doanh thu từ bán lẻ và dịch vụ cho thuê thiết bị theo kỳ kế toán.");
+        JLabel lblSub = new JLabel("Hệ thống tổng hợp chỉ số kinh doanh, phân tích cơ cấu doanh thu và xuất báo cáo kiểm toán doanh nghiệp.");
         lblSub.setFont(UIUtils.FONT_SUBTITLE);
         lblSub.setForeground(UIUtils.COLOR_TEXT_MUTED);
 
-        headerTitle.add(lblTitle, BorderLayout.NORTH);
-        headerTitle.add(lblSub, BorderLayout.SOUTH);
-        topContainer.add(headerTitle, BorderLayout.NORTH);
+        titlePanel.add(lblTitle, BorderLayout.NORTH);
+        titlePanel.add(lblSub, BorderLayout.SOUTH);
+        container.add(titlePanel, BorderLayout.NORTH);
 
-        // Filter Bar
+        // Thanh công cụ bộ lọc
         JPanel filterBar = new JPanel(new BorderLayout());
-        filterBar.setOpaque(false);
+        filterBar.setBackground(Color.WHITE);
+        filterBar.setBorder(new CompoundBorder(
+                new LineBorder(UIUtils.COLOR_BORDER, 1, true),
+                new EmptyBorder(10, 16, 10, 16)
+        ));
 
-        JPanel leftFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        // Nhóm bên trái: Chọn kỳ và khoảng ngày
+        JPanel leftFilter = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
         leftFilter.setOpaque(false);
 
-        cboPeriod = new JComboBox<>(new String[]{"Hôm nay", "7 ngày qua", "Tháng này", "Năm nay"});
-        cboPeriod.setFont(UIUtils.FONT_BODY);
-        cboPeriod.setPreferredSize(new Dimension(160, 36));
-        cboPeriod.addActionListener(e -> loadAnalyticsAsync());
+        JLabel lblPreset = new JLabel("Kỳ Báo Cáo:");
+        lblPreset.setFont(UIUtils.FONT_BODY_BOLD);
+        lblPreset.setForeground(UIUtils.COLOR_TEXT_MAIN);
 
-        JButton btnReload = new JButton("Tải Lại Dữ Liệu");
-        btnReload.setFont(UIUtils.FONT_BODY_BOLD);
-        btnReload.setBackground(Color.WHITE);
-        btnReload.setBorder(BorderFactory.createLineBorder(UIUtils.COLOR_BORDER, 1));
-        btnReload.setPreferredSize(new Dimension(130, 36));
-        btnReload.addActionListener(e -> loadAnalyticsAsync());
+        cboTimePreset = new JComboBox<>(new String[]{"Tháng Này", "7 Ngày Qua", "Hôm Nay", "Tùy Chọn Ngày"});
+        cboTimePreset.setFont(UIUtils.FONT_BODY);
+        cboTimePreset.setPreferredSize(new Dimension(140, 34));
+        cboTimePreset.addActionListener(e -> onPresetChanged());
+
+        JLabel lblFrom = new JLabel("Từ ngày:");
+        lblFrom.setFont(UIUtils.FONT_BODY);
+        txtFromDate = new JTextField(10);
+        txtFromDate.setFont(UIUtils.FONT_BODY);
+        txtFromDate.setPreferredSize(new Dimension(105, 34));
+
+        JLabel lblTo = new JLabel("Đến ngày:");
+        lblTo.setFont(UIUtils.FONT_BODY);
+        txtToDate = new JTextField(10);
+        txtToDate.setFont(UIUtils.FONT_BODY);
+        txtToDate.setPreferredSize(new Dimension(105, 34));
+
+        btnFilter = new JButton("📊  Xem Báo Cáo");
+        btnFilter.setFont(UIUtils.FONT_BODY_BOLD);
+        btnFilter.setBackground(UIUtils.COLOR_PRIMARY);
+        btnFilter.setForeground(Color.WHITE);
+        btnFilter.setFocusPainted(false);
+        btnFilter.setBorderPainted(false);
+        btnFilter.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        btnFilter.setPreferredSize(new Dimension(140, 34));
+        btnFilter.addActionListener(e -> loadReportDataAsync());
+
+        leftFilter.add(lblPreset);
+        leftFilter.add(cboTimePreset);
+        leftFilter.add(Box.createHorizontalStrut(6));
+        leftFilter.add(lblFrom);
+        leftFilter.add(txtFromDate);
+        leftFilter.add(lblTo);
+        leftFilter.add(txtToDate);
+        leftFilter.add(btnFilter);
+
+        // Nhóm bên phải: Nút Xuất CSV và Label Loading
+        JPanel rightFilter = new JPanel(new FlowLayout(FlowLayout.RIGHT, 12, 0));
+        rightFilter.setOpaque(false);
 
         lblLoadingStatus = new JLabel("● Sẵn sàng");
         lblLoadingStatus.setFont(UIUtils.FONT_SMALL);
         lblLoadingStatus.setForeground(UIUtils.COLOR_SUCCESS);
 
-        leftFilter.add(new JLabel("Kỳ Báo Cáo:"));
-        leftFilter.add(cboPeriod);
-        leftFilter.add(btnReload);
-        leftFilter.add(lblLoadingStatus);
+        btnExport = new JButton("📥  Xuất Báo Cáo (CSV/Excel)");
+        btnExport.setFont(UIUtils.FONT_BODY_BOLD);
+        btnExport.setBackground(new Color(22, 163, 74)); // Green 600
+        btnExport.setForeground(Color.WHITE);
+        btnExport.setFocusPainted(false);
+        btnExport.setBorderPainted(false);
+        btnExport.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        btnExport.setPreferredSize(new Dimension(210, 34));
+        btnExport.addActionListener(e -> exportReportData());
 
-        JPanel rightAction = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
-        rightAction.setOpaque(false);
-
-        JButton btnExportCSV = new JButton("📥  Xuất Báo Cáo CSV (UTF-8)");
-        btnExportCSV.setFont(UIUtils.FONT_BODY_BOLD);
-        btnExportCSV.setBackground(new Color(22, 101, 52)); // Green 800
-        btnExportCSV.setForeground(Color.WHITE);
-        btnExportCSV.setFocusPainted(false);
-        btnExportCSV.setBorderPainted(false);
-        btnExportCSV.setPreferredSize(new Dimension(220, 36));
-        btnExportCSV.setCursor(new Cursor(Cursor.HAND_CURSOR));
-        btnExportCSV.addActionListener(e -> exportReportToCSV());
-
-        rightAction.add(btnExportCSV);
+        rightFilter.add(lblLoadingStatus);
+        rightFilter.add(btnExport);
 
         filterBar.add(leftFilter, BorderLayout.WEST);
-        filterBar.add(rightAction, BorderLayout.EAST);
-        topContainer.add(filterBar, BorderLayout.SOUTH);
+        filterBar.add(rightFilter, BorderLayout.EAST);
+        container.add(filterBar, BorderLayout.SOUTH);
 
-        add(topContainer, BorderLayout.NORTH);
-
-        // ================= 2. TOP 4 KPI CARDS =================
-        JPanel cardsContainer = new JPanel(new GridLayout(1, 4, 16, 0));
-        cardsContainer.setOpaque(false);
-        cardsContainer.setPreferredSize(new Dimension(0, 95));
-
-        lblTotalSaleRevenue = new JLabel("0 VNĐ");
-        lblTotalRentalRevenue = new JLabel("0 VNĐ");
-        lblActiveRentalCount = new JLabel("0");
-        lblTotalDevicesProcessed = new JLabel("0 Thiết Bị");
-
-        cardsContainer.add(createKpiCard("DOANH THU BÁN HÀNG", lblTotalSaleRevenue, "Tổng từ hóa đơn bán lẻ", UIUtils.COLOR_PRIMARY));
-        cardsContainer.add(createKpiCard("DOANH THU CHO THUÊ", lblTotalRentalRevenue, "Tổng tiền thuê đã thu", UIUtils.COLOR_ACCENT));
-        cardsContainer.add(createKpiCard("HỢP ĐỒNG ĐANG THUÊ", lblActiveRentalCount, "Số hợp đồng trạng thái ACTIVE", new Color(217, 119, 6))); // Amber
-        cardsContainer.add(createKpiCard("THIẾT BỊ ĐÃ XỬ LÝ", lblTotalDevicesProcessed, "Tổng máy bán & cho thuê", UIUtils.COLOR_SUCCESS));
-
-        // ================= 3. DETAILED ANALYTICS TABBED PANE =================
-        JTabbedPane tabbedPane = new JTabbedPane();
-        tabbedPane.setFont(UIUtils.FONT_BODY_BOLD);
-
-        // TAB 1: CHI TIẾT DOANH THU BÁN HÀNG
-        JPanel tabSale = new JPanel(new BorderLayout(0, 10));
-        tabSale.setBackground(Color.WHITE);
-        tabSale.setBorder(new EmptyBorder(12, 14, 12, 14));
-
-        String[] saleCols = {"Mã Đơn", "Ngày Bán", "Khách Hàng", "SĐT", "Số Thiết Bị", "Tổng Tiền Hàng", "Điểm Dùng", "Thực Thu (VNĐ)", "PT Thanh Toán"};
-        saleReportModel = new DefaultTableModel(saleCols, 0) {
-            @Override
-            public boolean isCellEditable(int r, int c) { return false; }
-        };
-        saleReportTable = new JTable(saleReportModel);
-        setupTableStyle(saleReportTable);
-        tabSale.add(new JScrollPane(saleReportTable), BorderLayout.CENTER);
-
-        // TAB 2: CHI TIẾT HỢP ĐỒNG CHO THUÊ
-        JPanel tabRental = new JPanel(new BorderLayout(0, 10));
-        tabRental.setBackground(Color.WHITE);
-        tabRental.setBorder(new EmptyBorder(12, 14, 12, 14));
-
-        String[] rentCols = {"Mã HĐ", "Khách Hàng", "SĐT", "Ngày Bắt Đầu", "Hạn Trả", "Số Máy Thuê", "Tiền Thuê", "Tiền Cọc", "Trạng Thái"};
-        rentalReportModel = new DefaultTableModel(rentCols, 0) {
-            @Override
-            public boolean isCellEditable(int r, int c) { return false; }
-        };
-        rentalReportTable = new JTable(rentalReportModel);
-        setupTableStyle(rentalReportTable);
-        tabRental.add(new JScrollPane(rentalReportTable), BorderLayout.CENTER);
-
-        // TAB 3: TOP 5 THIẾT BỊ BÁN CHẠY & CHO THUÊ NHIỀU NHẤT
-        JPanel tabTopDevices = new JPanel(new BorderLayout(0, 10));
-        tabTopDevices.setBackground(Color.WHITE);
-        tabTopDevices.setBorder(new EmptyBorder(12, 14, 12, 14));
-
-        String[] topCols = {"Xếp Hạng", "Mẫu Sản Phẩm Thiết Bị", "Số Lần Giao Dịch Bán", "Số Lần Cho Thuê", "Tổng Lượt Khai Thác"};
-        topDevicesModel = new DefaultTableModel(topCols, 0) {
-            @Override
-            public boolean isCellEditable(int r, int c) { return false; }
-        };
-        topDevicesTable = new JTable(topDevicesModel);
-        setupTableStyle(topDevicesTable);
-        tabTopDevices.add(new JScrollPane(topDevicesTable), BorderLayout.CENTER);
-
-        tabbedPane.addTab("🛒  Chi Tiết Doanh Thu Bán Hàng", tabSale);
-        tabbedPane.addTab("📋  Chi Tiết Hợp Đồng Cho Thuê", tabRental);
-        tabbedPane.addTab("🔥  Top Thiết Bị Khai Thác Tốt Nhất", tabTopDevices);
-
-        JPanel centerWrapper = new JPanel(new BorderLayout(0, 16));
-        centerWrapper.setOpaque(false);
-        centerWrapper.add(cardsContainer, BorderLayout.NORTH);
-        centerWrapper.add(tabbedPane, BorderLayout.CENTER);
-
-        add(centerWrapper, BorderLayout.CENTER);
+        return container;
     }
 
-    private void setupTableStyle(JTable table) {
-        table.setFont(UIUtils.FONT_BODY);
-        table.setRowHeight(34);
-        table.getTableHeader().setFont(UIUtils.FONT_BODY_BOLD);
-        table.getTableHeader().setBackground(new Color(241, 245, 249));
-        table.setShowVerticalLines(false);
-        table.setGridColor(UIUtils.COLOR_BORDER);
+    /**
+     * Thiết lập các mốc ngày mặc định ban đầu.
+     */
+    private void setupDefaultDates() {
+        LocalDate now = LocalDate.now();
+        LocalDate firstDay = now.withDayOfMonth(1);
+        txtFromDate.setText(firstDay.format(DATE_FORMATTER));
+        txtToDate.setText(now.format(DATE_FORMATTER));
     }
 
-    private JPanel createKpiCard(String title, JLabel lblValue, String subtitle, Color color) {
-        JPanel card = new JPanel();
-        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
-        card.setBackground(Color.WHITE);
-        card.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(UIUtils.COLOR_BORDER, 1),
+    /**
+     * Tự động điều chỉnh khoảng ngày theo lựa chọn trong Preset.
+     */
+    private void onPresetChanged() {
+        String selected = (String) cboTimePreset.getSelectedItem();
+        LocalDate now = LocalDate.now();
+
+        if ("Hôm Nay".equals(selected)) {
+            txtFromDate.setText(now.format(DATE_FORMATTER));
+            txtToDate.setText(now.format(DATE_FORMATTER));
+        } else if ("7 Ngày Qua".equals(selected)) {
+            txtFromDate.setText(now.minusDays(7).format(DATE_FORMATTER));
+            txtToDate.setText(now.format(DATE_FORMATTER));
+        } else if ("Tháng Này".equals(selected)) {
+            txtFromDate.setText(now.withDayOfMonth(1).format(DATE_FORMATTER));
+            txtToDate.setText(now.format(DATE_FORMATTER));
+        }
+        // "Tùy Chọn Ngày" cho phép người dùng tự do nhập
+    }
+
+    /**
+     * Tạo 4 Thẻ KPI Summary Cards với thiết kế UI chuẩn doanh nghiệp.
+     */
+    private JPanel createStatCardsPanel() {
+        JPanel panel = new JPanel(new GridLayout(1, 4, 16, 0));
+        panel.setOpaque(false);
+
+        cardSales = new StatCard("💰  Doanh Thu Bán Hàng", "0 VNĐ", "Đang cập nhật...", new Color(22, 163, 74), new Color(240, 253, 244));
+        cardRental = new StatCard("🔄  Doanh Thu Cho Thuê", "0 VNĐ", "Đang cập nhật...", UIUtils.COLOR_PRIMARY, new Color(239, 246, 255));
+        cardCosts = new StatCard("🛠️  Chi Phí (Bảo Trì & Nhập)", "0 VNĐ", "Đang cập nhật...", new Color(220, 38, 38), new Color(254, 242, 242));
+        cardProfit = new StatCard("📈  Lợi Nhuận Ước Tính", "0 VNĐ", "Đang cập nhật...", new Color(124, 58, 237), new Color(245, 243, 255));
+
+        panel.add(cardSales);
+        panel.add(cardRental);
+        panel.add(cardCosts);
+        panel.add(cardProfit);
+
+        return panel;
+    }
+
+    /**
+     * Tab 1: Giao diện trực quan gồm Biểu đồ Swing 2D và Bảng Top 5 sản phẩm.
+     */
+    private JPanel createChartAndTopPanel() {
+        JPanel panel = new JPanel(new BorderLayout(16, 16));
+        panel.setBackground(Color.WHITE);
+        panel.setBorder(new EmptyBorder(16, 16, 16, 16));
+
+        // Phía trên hoặc bên trái: Biểu đồ xu hướng
+        revenueChartPanel = new RevenueChartPanel();
+        revenueChartPanel.setPreferredSize(new Dimension(0, 280));
+        revenueChartPanel.setBorder(new CompoundBorder(
+                new LineBorder(UIUtils.COLOR_BORDER, 1, true),
                 new EmptyBorder(12, 16, 12, 16)
         ));
 
-        JLabel lblT = new JLabel(title);
-        lblT.setFont(new Font("Segoe UI", Font.BOLD, 11));
-        lblT.setForeground(UIUtils.COLOR_TEXT_MUTED);
+        // Phía dưới: Khung Top 5 Sản Phẩm Bán/Cho Thuê Chạy Nhất
+        JPanel topProductsPanel = new JPanel(new BorderLayout(0, 8));
+        topProductsPanel.setOpaque(false);
 
-        lblValue.setFont(new Font("Segoe UI", Font.BOLD, 18));
-        lblValue.setForeground(color);
+        JLabel lblTopTitle = new JLabel("🏆  TOP 5 SẢN PHẨM & THIẾT BỊ CÔNG NGHỆ DOANH THU CAO NHẤT");
+        lblTopTitle.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        lblTopTitle.setForeground(UIUtils.COLOR_TEXT_MAIN);
+        topProductsPanel.add(lblTopTitle, BorderLayout.NORTH);
 
-        JLabel lblSub = new JLabel(subtitle);
-        lblSub.setFont(UIUtils.FONT_SMALL);
-        lblSub.setForeground(new Color(100, 116, 139));
+        String[] headers = {"Xếp Hạng", "Mã Sản Phẩm", "Tên Thiết Bị / Dòng Máy", "Thương Hiệu", "SL Bán Đứt", "Lượt Cho Thuê", "Tổng Doanh Thu"};
+        modelTopProducts = new DefaultTableModel(headers, 0) {
+            @Override
+            public boolean isCellEditable(int row, int column) { return false; }
+        };
 
-        card.add(lblT);
-        card.add(Box.createVerticalStrut(4));
-        card.add(lblValue);
-        card.add(Box.createVerticalStrut(2));
-        card.add(lblSub);
+        tblTopProducts = new JTable(modelTopProducts);
+        tblTopProducts.setFont(UIUtils.FONT_BODY);
+        tblTopProducts.setRowHeight(32);
+        tblTopProducts.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        tblTopProducts.setShowGrid(true);
+        tblTopProducts.setGridColor(UIUtils.COLOR_BORDER);
 
-        return card;
+        JTableHeader th = tblTopProducts.getTableHeader();
+        th.setFont(UIUtils.FONT_BODY_BOLD);
+        th.setBackground(new Color(241, 245, 249));
+        th.setForeground(UIUtils.COLOR_TEXT_MAIN);
+        th.setPreferredSize(new Dimension(0, 36));
+
+        // Căn lề các cột
+        DefaultTableCellRenderer centerRenderer = new DefaultTableCellRenderer();
+        centerRenderer.setHorizontalAlignment(SwingConstants.CENTER);
+        tblTopProducts.getColumnModel().getColumn(0).setCellRenderer(centerRenderer);
+        tblTopProducts.getColumnModel().getColumn(1).setCellRenderer(centerRenderer);
+        tblTopProducts.getColumnModel().getColumn(4).setCellRenderer(centerRenderer);
+        tblTopProducts.getColumnModel().getColumn(5).setCellRenderer(centerRenderer);
+
+        DefaultTableCellRenderer rightRenderer = new DefaultTableCellRenderer();
+        rightRenderer.setHorizontalAlignment(SwingConstants.RIGHT);
+        tblTopProducts.getColumnModel().getColumn(6).setCellRenderer(rightRenderer);
+
+        tblTopProducts.getColumnModel().getColumn(0).setPreferredWidth(70);
+        tblTopProducts.getColumnModel().getColumn(1).setPreferredWidth(100);
+        tblTopProducts.getColumnModel().getColumn(2).setPreferredWidth(280);
+
+        JScrollPane scrollPane = new JScrollPane(tblTopProducts);
+        scrollPane.setBorder(new LineBorder(UIUtils.COLOR_BORDER, 1, true));
+        scrollPane.setPreferredSize(new Dimension(0, 180));
+        topProductsPanel.add(scrollPane, BorderLayout.CENTER);
+
+        panel.add(revenueChartPanel, BorderLayout.CENTER);
+        panel.add(topProductsPanel, BorderLayout.SOUTH);
+
+        return panel;
     }
 
-    // ================= TÍNH TOÁN BẤT ĐỒNG BỘ VỚI SWINGWORKER =================
+    /**
+     * Tab 2: Bảng số liệu chi tiết từng đơn hàng, hợp đồng và chi phí.
+     */
+    private JPanel createDetailTablePanel() {
+        JPanel panel = new JPanel(new BorderLayout(0, 12));
+        panel.setBackground(Color.WHITE);
+        panel.setBorder(new EmptyBorder(16, 16, 16, 16));
 
-    public void loadAnalyticsAsync() {
-        lblLoadingStatus.setText("● Đang tính toán số liệu...");
-        lblLoadingStatus.setForeground(UIUtils.COLOR_PRIMARY);
+        // Thanh tìm kiếm nhanh trên bảng chi tiết
+        JPanel toolbar = new JPanel(new BorderLayout());
+        toolbar.setOpaque(false);
 
-        String period = (String) cboPeriod.getSelectedItem();
-        LocalDate now = LocalDate.now();
+        JLabel lblDetailTitle = new JLabel("NHẬT KÝ CHI TIẾT CÁC PHIẾU GIAO DỊCH KINH DOANH TRONG KỲ");
+        lblDetailTitle.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        lblDetailTitle.setForeground(UIUtils.COLOR_TEXT_MAIN);
 
-        LocalDate startDate;
-        if ("Hôm nay".equals(period)) {
-            startDate = now;
-        } else if ("7 ngày qua".equals(period)) {
-            startDate = now.minusDays(7);
-        } else if ("Tháng này".equals(period)) {
-            startDate = now.withDayOfMonth(1);
-        } else {
-            // Năm nay
-            startDate = now.withDayOfYear(1);
+        JPanel searchBox = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        searchBox.setOpaque(false);
+        JLabel lblSearch = new JLabel("Lọc nhanh:");
+        lblSearch.setFont(UIUtils.FONT_BODY);
+        txtSearchDetail = new JTextField(16);
+        txtSearchDetail.setFont(UIUtils.FONT_BODY);
+        txtSearchDetail.setPreferredSize(new Dimension(180, 30));
+        txtSearchDetail.addActionListener(e -> filterDetailTable());
+
+        searchBox.add(lblSearch);
+        searchBox.add(txtSearchDetail);
+
+        toolbar.add(lblDetailTitle, BorderLayout.WEST);
+        toolbar.add(searchBox, BorderLayout.EAST);
+        panel.add(toolbar, BorderLayout.NORTH);
+
+        // Bảng dữ liệu
+        String[] headers = {"STT", "Ngày Phát Sinh", "Loại Nghiệp Vụ", "Mã Chứng Từ", "Khách Hàng / Đối Tác", "Doanh Thu Thu Được", "Chi Phí Phát Sinh", "Lợi Nhuận Ghi Nhận"};
+        modelDetails = new DefaultTableModel(headers, 0) {
+            @Override
+            public boolean isCellEditable(int row, int column) { return false; }
+        };
+
+        tblDetails = new JTable(modelDetails);
+        tblDetails.setFont(UIUtils.FONT_BODY);
+        tblDetails.setRowHeight(30);
+        tblDetails.setShowGrid(true);
+        tblDetails.setGridColor(UIUtils.COLOR_BORDER);
+
+        JTableHeader th = tblDetails.getTableHeader();
+        th.setFont(UIUtils.FONT_BODY_BOLD);
+        th.setBackground(new Color(241, 245, 249));
+        th.setForeground(UIUtils.COLOR_TEXT_MAIN);
+        th.setPreferredSize(new Dimension(0, 36));
+
+        DefaultTableCellRenderer centerRenderer = new DefaultTableCellRenderer();
+        centerRenderer.setHorizontalAlignment(SwingConstants.CENTER);
+        tblDetails.getColumnModel().getColumn(0).setCellRenderer(centerRenderer);
+        tblDetails.getColumnModel().getColumn(1).setCellRenderer(centerRenderer);
+        tblDetails.getColumnModel().getColumn(2).setCellRenderer(centerRenderer);
+        tblDetails.getColumnModel().getColumn(3).setCellRenderer(centerRenderer);
+
+        DefaultTableCellRenderer rightRenderer = new DefaultTableCellRenderer();
+        rightRenderer.setHorizontalAlignment(SwingConstants.RIGHT);
+        tblDetails.getColumnModel().getColumn(5).setCellRenderer(rightRenderer);
+        tblDetails.getColumnModel().getColumn(6).setCellRenderer(rightRenderer);
+        tblDetails.getColumnModel().getColumn(7).setCellRenderer(rightRenderer);
+
+        tblDetails.getColumnModel().getColumn(0).setPreferredWidth(50);
+        tblDetails.getColumnModel().getColumn(1).setPreferredWidth(110);
+        tblDetails.getColumnModel().getColumn(2).setPreferredWidth(110);
+        tblDetails.getColumnModel().getColumn(3).setPreferredWidth(140);
+        tblDetails.getColumnModel().getColumn(4).setPreferredWidth(240);
+
+        JScrollPane scrollPane = new JScrollPane(tblDetails);
+        scrollPane.setBorder(new LineBorder(UIUtils.COLOR_BORDER, 1, true));
+        panel.add(scrollPane, BorderLayout.CENTER);
+
+        return panel;
+    }
+
+    /**
+     * Nạp dữ liệu báo cáo bất đồng bộ qua SwingWorker đảm bảo không khóa luồng EDT.
+     */
+    private void loadReportDataAsync() {
+        final LocalDate fromDate;
+        final LocalDate toDate;
+
+        try {
+            fromDate = LocalDate.parse(txtFromDate.getText().trim(), DATE_FORMATTER);
+            toDate = LocalDate.parse(txtToDate.getText().trim(), DATE_FORMATTER);
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this,
+                    "Định dạng ngày không hợp lệ! Vui lòng nhập đúng chuẩn yyyy-MM-dd (Ví dụ: 2026-11-01).",
+                    "Lỗi Định Dạng", JOptionPane.WARNING_MESSAGE);
+            return;
         }
 
-        SwingWorker<AnalyticsResult, Void> worker = new SwingWorker<>() {
+        lblLoadingStatus.setText("● Đang tổng hợp dữ liệu...");
+        lblLoadingStatus.setForeground(new Color(234, 88, 12)); // Orange
+        btnFilter.setEnabled(false);
+        btnExport.setEnabled(false);
+
+        SwingWorker<ReportWorkerResult, Void> worker = new SwingWorker<>() {
             @Override
-            protected AnalyticsResult doInBackground() {
-                AnalyticsResult result = new AnalyticsResult();
-
-                // 1. Phân tích Đơn hàng Bán lẻ
-                List<Order> allOrders = orderRepository.findAll();
-                for (Order o : allOrders) {
-                    if (o.getOrderDate() != null && !o.getOrderDate().isBefore(startDate)) {
-                        result.filteredOrders.add(o);
-                        result.totalSaleRevenue += o.getFinalAmount();
-                        if (o.getItems() != null) {
-                            result.totalSoldDevices += o.getItems().size();
-                            for (OrderItem item : o.getItems()) {
-                                result.productSaleCounts.put(item.getProductName(),
-                                        result.productSaleCounts.getOrDefault(item.getProductName(), 0) + item.getQuantity());
-                            }
-                        }
-                    }
-                }
-
-                // 2. Phân tích Hợp đồng cho thuê
-                List<RentalContract> allContracts = rentalContractRepository.findAll();
-                for (RentalContract c : allContracts) {
-                    if (c.getStartDate() != null && !c.getStartDate().isBefore(startDate)) {
-                        result.filteredContracts.add(c);
-                        result.totalRentalRevenue += c.getTotalRentalFee();
-                        if (RentalContract.STATUS_ACTIVE.equals(c.getStatus())) {
-                            result.activeRentals++;
-                        }
-                        if (c.getItems() != null) {
-                            result.totalRentedDevices += c.getItems().size();
-                            for (RentalItem rItem : c.getItems()) {
-                                result.productRentCounts.put(rItem.getProductName(),
-                                        result.productRentCounts.getOrDefault(rItem.getProductName(), 0) + 1);
-                            }
-                        }
-                    }
-                }
-
-                return result;
+            protected ReportWorkerResult doInBackground() {
+                RevenueReportData reportData = reportService.getRevenueReport(fromDate, toDate);
+                List<TopProductReport> topProducts = reportService.getTopSellingProducts(5);
+                return new ReportWorkerResult(reportData, topProducts);
             }
 
             @Override
             protected void done() {
                 try {
-                    AnalyticsResult res = get();
+                    ReportWorkerResult result = get();
+                    currentReportData = result.reportData;
+                    currentTopProducts = result.topProducts;
 
-                    // Cập nhật thẻ KPI
-                    currentSaleRev = res.totalSaleRevenue;
-                    currentRentRev = res.totalRentalRevenue;
-                    currentActiveRentals = res.activeRentals;
-                    currentDevicesTotal = res.totalSoldDevices + res.totalRentedDevices;
+                    updateUIWithReportData(currentReportData, currentTopProducts);
 
-                    lblTotalSaleRevenue.setText(String.format("%,.0f VNĐ", currentSaleRev));
-                    lblTotalRentalRevenue.setText(String.format("%,.0f VNĐ", currentRentRev));
-                    lblActiveRentalCount.setText(currentActiveRentals + " Hợp Đồng");
-                    lblTotalDevicesProcessed.setText(currentDevicesTotal + " Thiết Bị");
-
-                    // Đổ dữ liệu Tab Bán Hàng
-                    saleReportModel.setRowCount(0);
-                    for (Order o : res.filteredOrders) {
-                        saleReportModel.addRow(new Object[]{
-                                o.getId(),
-                                o.getOrderDate(),
-                                o.getCustomerName(),
-                                o.getCustomerPhone(),
-                                o.getItems() != null ? o.getItems().size() : 0,
-                                String.format("%,.0f đ", o.getTotalAmount()),
-                                o.getPointsUsed(),
-                                String.format("%,.0f đ", o.getFinalAmount()),
-                                o.getPaymentMethod()
-                        });
-                    }
-
-                    // Đổ dữ liệu Tab Cho Thuê
-                    rentalReportModel.setRowCount(0);
-                    for (RentalContract c : res.filteredContracts) {
-                        rentalReportModel.addRow(new Object[]{
-                                c.getId(),
-                                c.getCustomerName(),
-                                c.getCustomerPhone(),
-                                c.getStartDate(),
-                                c.getExpectedEndDate(),
-                                c.getItems() != null ? c.getItems().size() : 0,
-                                String.format("%,.0f đ", c.getTotalRentalFee()),
-                                String.format("%,.0f đ", c.getTotalDeposit()),
-                                c.getStatus()
-                        });
-                    }
-
-                    // Đổ dữ liệu Tab Top 5 Thiết bị
-                    topDevicesModel.setRowCount(0);
-                    Set<String> allProductNames = new HashSet<>();
-                    allProductNames.addAll(res.productSaleCounts.keySet());
-                    allProductNames.addAll(res.productRentCounts.keySet());
-
-                    List<ProductRanking> rankingList = new ArrayList<>();
-                    for (String prodName : allProductNames) {
-                        int saleQty = res.productSaleCounts.getOrDefault(prodName, 0);
-                        int rentQty = res.productRentCounts.getOrDefault(prodName, 0);
-                        rankingList.add(new ProductRanking(prodName, saleQty, rentQty));
-                    }
-                    rankingList.sort((a, b) -> Integer.compare(b.totalCount, a.totalCount));
-
-                    int rank = 1;
-                    for (ProductRanking pr : rankingList) {
-                        if (rank > 5) break;
-                        topDevicesModel.addRow(new Object[]{
-                                "Top " + rank,
-                                pr.productName,
-                                pr.saleCount + " lần",
-                                pr.rentCount + " lần",
-                                pr.totalCount + " lượt"
-                        });
-                        rank++;
-                    }
-
-                    lblLoadingStatus.setText("● Cập nhật thành công lúc " + java.time.LocalTime.now().toString().substring(0, 8));
+                    lblLoadingStatus.setText("● Cập nhật thành công lúc: " + java.time.LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")));
                     lblLoadingStatus.setForeground(UIUtils.COLOR_SUCCESS);
 
                 } catch (Exception ex) {
-                    System.err.println("[ReportPanel] Lỗi tính toán báo cáo: " + ex.getMessage());
-                    lblLoadingStatus.setText("● Lỗi khi tải số liệu thống kê!");
+                    lblLoadingStatus.setText("● Lỗi khi tải dữ liệu");
                     lblLoadingStatus.setForeground(UIUtils.COLOR_DANGER);
+                    System.err.println("[ReportPanel] Lỗi tải báo cáo: " + ex.getMessage());
+                } finally {
+                    btnFilter.setEnabled(true);
+                    btnExport.setEnabled(true);
                 }
             }
         };
+
         worker.execute();
     }
 
-    // ================= XUẤT BÁO CÁO CSV (UTF-8) =================
+    /**
+     * Cập nhật dữ liệu đã tính toán lên các thành phần giao diện.
+     */
+    private void updateUIWithReportData(RevenueReportData data, List<TopProductReport> topProducts) {
+        if (data == null) return;
 
-    private void exportReportToCSV() {
+        // 1. Cập nhật 4 Stat Cards
+        cardSales.setValue(CURRENCY_FORMAT.format(data.getTotalSaleRevenue()));
+        cardSales.setSubtitle(data.getTotalOrdersCount() + " hóa đơn bán lẻ đã thanh toán");
+
+        cardRental.setValue(CURRENCY_FORMAT.format(data.getTotalRentalRevenue()));
+        cardRental.setSubtitle(data.getTotalRentalsCount() + " hợp đồng cho thuê thiết bị");
+
+        cardCosts.setValue(CURRENCY_FORMAT.format(data.getTotalCost()));
+        cardCosts.setSubtitle(data.getTotalMaintenanceCount() + " lần bảo trì | " + data.getTotalImportsCount() + " đợt nhập");
+
+        cardProfit.setValue(CURRENCY_FORMAT.format(data.getGrossProfit()));
+        cardProfit.setSubtitle("Doanh thu ròng - Chi phí trực tiếp");
+
+        // 2. Cập nhật Biểu đồ 2D
+        revenueChartPanel.setData(data.getDailyPoints());
+
+        // 3. Cập nhật Bảng Top 5 Sản Phẩm
+        modelTopProducts.setRowCount(0);
+        if (topProducts != null) {
+            int rank = 1;
+            for (TopProductReport p : topProducts) {
+                modelTopProducts.addRow(new Object[]{
+                        "#" + rank++,
+                        p.getProductId(),
+                        p.getProductName(),
+                        p.getBrand(),
+                        p.getQuantitySold() + " máy",
+                        p.getRentalCount() + " lượt",
+                        CURRENCY_FORMAT.format(p.getTotalRevenue())
+                });
+            }
+        }
+
+        // 4. Cập nhật Bảng Chi Tiết Giao Dịch
+        populateDetailTable(data.getTransactions());
+    }
+
+    private void populateDetailTable(List<ReportTransaction> list) {
+        modelDetails.setRowCount(0);
+        if (list == null) return;
+
+        int stt = 1;
+        for (ReportTransaction tx : list) {
+            modelDetails.addRow(new Object[]{
+                    stt++,
+                    tx.getDateStr(),
+                    tx.getType(),
+                    tx.getCode(),
+                    tx.getCustomerName(),
+                    tx.getRevenue() > 0 ? CURRENCY_FORMAT.format(tx.getRevenue()) : "-",
+                    tx.getCost() > 0 ? CURRENCY_FORMAT.format(tx.getCost()) : "-",
+                    CURRENCY_FORMAT.format(tx.getProfit())
+            });
+        }
+    }
+
+    /**
+     * Lọc bảng chi tiết theo từ khóa nhập trong ô tìm kiếm.
+     */
+    private void filterDetailTable() {
+        if (currentReportData == null) return;
+        String kw = txtSearchDetail.getText().trim().toLowerCase();
+        if (kw.isEmpty()) {
+            populateDetailTable(currentReportData.getTransactions());
+            return;
+        }
+
+        List<ReportTransaction> filtered = new ArrayList<>();
+        for (ReportTransaction tx : currentReportData.getTransactions()) {
+            if (tx.getCode().toLowerCase().contains(kw) ||
+                    tx.getCustomerName().toLowerCase().contains(kw) ||
+                    tx.getType().toLowerCase().contains(kw) ||
+                    tx.getDateStr().contains(kw)) {
+                filtered.add(tx);
+            }
+        }
+        populateDetailTable(filtered);
+    }
+
+    /**
+     * Thực hiện xuất file báo cáo dữ liệu chuẩn CSV/Excel UTF-8.
+     */
+    private void exportReportData() {
+        if (currentReportData == null || currentReportData.getTransactions().isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Không có dữ liệu báo cáo trong kỳ này để xuất!", "Thông Báo", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
         JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("Chọn thư mục lưu báo cáo thống kê CSV");
-        fileChooser.setSelectedFile(new File("BaoCao_SmartTech_" + LocalDate.now() + ".csv"));
+        fileChooser.setDialogTitle("Chọn Thư Mục Lưu Báo Cáo Doanh Thu (CSV)");
+        String defaultFileName = "SmartTech_BaoCaoDoanhThu_" + LocalDate.now().format(DATE_FORMATTER) + ".csv";
+        fileChooser.setSelectedFile(new File(defaultFileName));
 
         int userSelection = fileChooser.showSaveDialog(this);
         if (userSelection == JFileChooser.APPROVE_OPTION) {
             File fileToSave = fileChooser.getSelectedFile();
             if (!fileToSave.getName().toLowerCase().endsWith(".csv")) {
-                fileToSave = new File(fileToSave.getAbsolutePath() + ".csv");
+                fileToSave = new File(fileToSave.getParentFile(), fileToSave.getName() + ".csv");
             }
 
-            try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(new FileOutputStream(fileToSave), StandardCharsets.UTF_8))) {
-                // Viết BOM UTF-8 để Microsoft Excel hiển thị tiếng Việt không bị lỗi font
-                writer.write('\ufeff');
+            // Chuẩn bị dữ liệu CSV
+            List<Object[]> rows = new ArrayList<>();
+            rows.add(new Object[]{"BÁO CÁO DOANH THU & TÀI CHÍNH DOANH NGHIỆP SMARTTECH ENTERPRISE"});
+            rows.add(new Object[]{"Thời gian xuất:", LocalDate.now().format(DATE_FORMATTER)});
+            rows.add(new Object[]{"Kỳ báo cáo:", txtFromDate.getText() + " đến " + txtToDate.getText()});
+            rows.add(new Object[]{""});
 
-                writer.println("==========================================================================");
-                writer.println("SMARTTECH ENTERPRISE - BÁO CÁO DOANH THU & HIỆU SUẤT HOẠT ĐỘNG");
-                writer.println("Thời điểm xuất báo cáo: " + LocalDate.now() + " | Kỳ: " + cboPeriod.getSelectedItem());
-                writer.println("==========================================================================");
-                writer.println();
+            rows.add(new Object[]{"TỔNG HỢP CHỈ SỐ KINH DOANH"});
+            rows.add(new Object[]{"Tổng Doanh Thu Bán Hàng (VNĐ):", currentReportData.getTotalSaleRevenue()});
+            rows.add(new Object[]{"Tổng Doanh Thu Cho Thuê (VNĐ):", currentReportData.getTotalRentalRevenue()});
+            rows.add(new Object[]{"Tổng Chi Phí Bảo Trì & Nhập Kho (VNĐ):", currentReportData.getTotalCost()});
+            rows.add(new Object[]{"Lợi Nhuận Gộp Ước Tính (VNĐ):", currentReportData.getGrossProfit()});
+            rows.add(new Object[]{""});
 
-                // KPI Tóm tắt
-                writer.println("--- 1. TỔNG QUAN CHỈ SỐ KINH DOANH (KPI) ---");
-                writer.println("Tổng doanh thu bán lẻ (VNĐ)," + String.format("%.0f", currentSaleRev));
-                writer.println("Tổng doanh thu cho thuê (VNĐ)," + String.format("%.0f", currentRentRev));
-                writer.println("Hợp đồng thuê đang chạy (Active)," + currentActiveRentals);
-                writer.println("Tổng số thiết bị đã giao dịch," + currentDevicesTotal);
-                writer.println();
+            rows.add(new Object[]{"DANH SÁCH CHI TIẾT CÁC PHIẾU GIAO DỊCH"});
+            rows.add(new Object[]{"STT", "Ngày Phát Sinh", "Loại Nghiệp Vụ", "Mã Chứng Từ", "Khách Hàng / Đối Tác", "Doanh Thu", "Chi Phí", "Lợi Nhuận"});
 
-                // Chi tiết Bán hàng
-                writer.println("--- 2. CHI TIẾT HÓA ĐƠN BÁN HÀNG ---");
-                writer.println("Mã Đơn,Ngày Bán,Khách Hàng,Số Điện Thoại,Số Thiết Bị,Thực Thu (VNĐ),PT Thanh Toán");
-                for (int i = 0; i < saleReportModel.getRowCount(); i++) {
-                    writer.println(String.format("%s,%s,\"%s\",%s,%s,%s,%s",
-                            saleReportModel.getValueAt(i, 0),
-                            saleReportModel.getValueAt(i, 1),
-                            saleReportModel.getValueAt(i, 2),
-                            saleReportModel.getValueAt(i, 3),
-                            saleReportModel.getValueAt(i, 4),
-                            saleReportModel.getValueAt(i, 7).toString().replace(" đ", "").replace(",", ""),
-                            saleReportModel.getValueAt(i, 8)
-                    ));
-                }
-                writer.println();
+            int stt = 1;
+            for (ReportTransaction tx : currentReportData.getTransactions()) {
+                rows.add(new Object[]{
+                        stt++,
+                        tx.getDateStr(),
+                        tx.getType(),
+                        tx.getCode(),
+                        tx.getCustomerName(),
+                        tx.getRevenue(),
+                        tx.getCost(),
+                        tx.getProfit()
+                });
+            }
 
-                // Chi tiết Cho thuê
-                writer.println("--- 3. CHI TIẾT HỢP ĐỒNG CHO THUÊ ---");
-                writer.println("Mã Hợp Đồng,Khách Hàng,Số Điện Thoại,Ngày Thuê,Hạn Trả,Tiền Thuê (VNĐ),Tiền Cọc (VNĐ),Trạng Thái");
-                for (int i = 0; i < rentalReportModel.getRowCount(); i++) {
-                    writer.println(String.format("%s,\"%s\",%s,%s,%s,%s,%s,%s",
-                            rentalReportModel.getValueAt(i, 0),
-                            rentalReportModel.getValueAt(i, 1),
-                            rentalReportModel.getValueAt(i, 2),
-                            rentalReportModel.getValueAt(i, 3),
-                            rentalReportModel.getValueAt(i, 4),
-                            rentalReportModel.getValueAt(i, 6).toString().replace(" đ", "").replace(",", ""),
-                            rentalReportModel.getValueAt(i, 7).toString().replace(" đ", "").replace(",", ""),
-                            rentalReportModel.getValueAt(i, 8)
-                    ));
-                }
-
+            boolean success = reportService.exportReportToCSV(fileToSave, rows);
+            if (success) {
                 JOptionPane.showMessageDialog(this,
-                        "Xuất báo cáo thành công ra file:\n" + fileToSave.getAbsolutePath(),
-                        "Thành Công",
-                        JOptionPane.INFORMATION_MESSAGE);
-
-            } catch (Exception ex) {
-                System.err.println("[ReportPanel] Lỗi xuất CSV: " + ex.getMessage());
-                JOptionPane.showMessageDialog(this, "Không thể xuất file CSV: " + ex.getMessage(), "Lỗi Xuất Báo Cáo", JOptionPane.ERROR_MESSAGE);
+                        "Xuất báo cáo thành công ra tập tin:\n" + fileToSave.getAbsolutePath(),
+                        "Xuất Báo Cáo Thành Công", JOptionPane.INFORMATION_MESSAGE);
+            } else {
+                JOptionPane.showMessageDialog(this,
+                        "Có lỗi xảy ra khi ghi file báo cáo!",
+                        "Lỗi Xuất File", JOptionPane.ERROR_MESSAGE);
             }
         }
     }
 
-    // Helper classes cho việc tổng hợp dữ liệu
-    private static class AnalyticsResult {
-        double totalSaleRevenue = 0.0;
-        double totalRentalRevenue = 0.0;
-        int activeRentals = 0;
-        int totalSoldDevices = 0;
-        int totalRentedDevices = 0;
+    private static class ReportWorkerResult {
+        final RevenueReportData reportData;
+        final List<TopProductReport> topProducts;
 
-        List<Order> filteredOrders = new ArrayList<>();
-        List<RentalContract> filteredContracts = new ArrayList<>();
-        Map<String, Integer> productSaleCounts = new HashMap<>();
-        Map<String, Integer> productRentCounts = new HashMap<>();
+        ReportWorkerResult(RevenueReportData reportData, List<TopProductReport> topProducts) {
+            this.reportData = reportData;
+            this.topProducts = topProducts;
+        }
     }
 
-    private static class ProductRanking {
-        String productName;
-        int saleCount;
-        int rentCount;
-        int totalCount;
+    // =========================================================================
+    // INNER CLASSES: CUSTOM STAT CARD & REVENUE CHART PANEL
+    // =========================================================================
 
-        ProductRanking(String name, int sale, int rent) {
-            this.productName = name;
-            this.saleCount = sale;
-            this.rentCount = rent;
-            this.totalCount = sale + rent;
+    /**
+     * Card hiển thị chỉ số KPI chuyên nghiệp.
+     */
+    private static class StatCard extends JPanel {
+        private final JLabel lblVal;
+        private final JLabel lblSub;
+
+        public StatCard(String title, String initialValue, String subtitle, Color themeColor, Color bgColor) {
+            setLayout(new BorderLayout(0, 6));
+            setBackground(bgColor);
+            setBorder(new CompoundBorder(
+                    new LineBorder(new Color(themeColor.getRed(), themeColor.getGreen(), themeColor.getBlue(), 60), 1, true),
+                    new EmptyBorder(14, 16, 14, 16)
+            ));
+
+            JLabel lblTitle = new JLabel(title);
+            lblTitle.setFont(new Font("Segoe UI", Font.BOLD, 12));
+            lblTitle.setForeground(themeColor);
+
+            lblVal = new JLabel(initialValue);
+            lblVal.setFont(new Font("Segoe UI", Font.BOLD, 18));
+            lblVal.setForeground(UIUtils.COLOR_TEXT_MAIN);
+
+            lblSub = new JLabel(subtitle);
+            lblSub.setFont(UIUtils.FONT_SMALL);
+            lblSub.setForeground(UIUtils.COLOR_TEXT_MUTED);
+
+            add(lblTitle, BorderLayout.NORTH);
+            add(lblVal, BorderLayout.CENTER);
+            add(lblSub, BorderLayout.SOUTH);
+        }
+
+        public void setValue(String val) { lblVal.setText(val); }
+        public void setSubtitle(String sub) { lblSub.setText(sub); }
+    }
+
+    /**
+     * Biểu đồ cột/đường vẽ bằng Custom Swing Graphics 2D trực tiếp trên JPanel.
+     */
+    private static class RevenueChartPanel extends JPanel {
+        private List<DailyRevenuePoint> points = new ArrayList<>();
+
+        public RevenueChartPanel() {
+            setBackground(Color.WHITE);
+        }
+
+        public void setData(List<DailyRevenuePoint> data) {
+            this.points = data != null ? data : new ArrayList<>();
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+
+            // Khử răng cưa Antialiasing
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+            int width = getWidth();
+            int height = getHeight();
+
+            int padLeft = 70;
+            int padRight = 30;
+            int padTop = 35;
+            int padBottom = 45;
+
+            // Tiêu đề & Chú thích (Legend)
+            g2.setFont(new Font("Segoe UI", Font.BOLD, 13));
+            g2.setColor(UIUtils.COLOR_TEXT_MAIN);
+            g2.drawString("XU HƯỚNG DOANH THU THEO MỐC THỜI GIAN", padLeft, 22);
+
+            // Legend
+            int legX = width - 260;
+            g2.setFont(UIUtils.FONT_SMALL);
+
+            g2.setColor(new Color(22, 163, 74)); // Green
+            g2.fillRect(legX, 12, 12, 12);
+            g2.setColor(UIUtils.COLOR_TEXT_MAIN);
+            g2.drawString("Doanh Thu Bán", legX + 16, 22);
+
+            g2.setColor(UIUtils.COLOR_PRIMARY); // Blue
+            g2.fillRect(legX + 120, 12, 12, 12);
+            g2.setColor(UIUtils.COLOR_TEXT_MAIN);
+            g2.drawString("Doanh Thu Thuê", legX + 136, 22);
+
+            int plotW = width - padLeft - padRight;
+            int plotH = height - padTop - padBottom;
+
+            if (plotW <= 0 || plotH <= 0) {
+                g2.dispose();
+                return;
+            }
+
+            // Tìm giá trị max để scale trục Y
+            double maxVal = 1000000.0;
+            for (DailyRevenuePoint pt : points) {
+                if (pt.getTotalRevenue() > maxVal) {
+                    maxVal = pt.getTotalRevenue();
+                }
+            }
+            // Làm tròn maxVal lên mốc đẹp
+            maxVal = Math.ceil(maxVal / 1000000.0) * 1000000.0;
+            if (maxVal == 0) maxVal = 1000000.0;
+
+            // Vẽ lưới trục Y (Gridlines)
+            int yTicks = 4;
+            g2.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+            DecimalFormat compactDf = new DecimalFormat("#,##0 Tr");
+
+            for (int i = 0; i <= yTicks; i++) {
+                int y = padTop + (int) ((double) (yTicks - i) / yTicks * plotH);
+                double val = (maxVal / yTicks) * i;
+
+                g2.setColor(new Color(241, 245, 249));
+                g2.drawLine(padLeft, y, width - padRight, y);
+
+                g2.setColor(UIUtils.COLOR_TEXT_MUTED);
+                String label = (val >= 1000000) ? compactDf.format(val / 1000000.0) : String.valueOf((int) val);
+                FontMetrics fm = g2.getFontMetrics();
+                g2.drawString(label, padLeft - fm.stringWidth(label) - 8, y + 4);
+            }
+
+            // Trục tọa độ X
+            g2.setColor(UIUtils.COLOR_BORDER);
+            g2.drawLine(padLeft, padTop + plotH, width - padRight, padTop + plotH);
+
+            if (points.isEmpty()) {
+                g2.setFont(UIUtils.FONT_BODY);
+                g2.setColor(UIUtils.COLOR_TEXT_MUTED);
+                String msg = "Không có giao dịch nào phát sinh trong khoảng thời gian đã chọn.";
+                FontMetrics fm = g2.getFontMetrics();
+                g2.drawString(msg, padLeft + (plotW - fm.stringWidth(msg)) / 2, padTop + plotH / 2);
+                g2.dispose();
+                return;
+            }
+
+            // Vẽ các cột Doanh Thu
+            int n = points.size();
+            double slotW = (double) plotW / n;
+            int barWidth = Math.max(6, Math.min(28, (int) (slotW * 0.35)));
+
+            for (int i = 0; i < n; i++) {
+                DailyRevenuePoint pt = points.get(i);
+                int slotCenterX = padLeft + (int) (i * slotW + slotW / 2);
+
+                int saleBarH = (int) ((pt.getSaleRevenue() / maxVal) * plotH);
+                int rentBarH = (int) ((pt.getRentalRevenue() / maxVal) * plotH);
+
+                int saleX = slotCenterX - barWidth - 1;
+                int saleY = padTop + plotH - saleBarH;
+
+                int rentX = slotCenterX + 1;
+                int rentY = padTop + plotH - rentBarH;
+
+                // Cột bán hàng (Xanh lá)
+                if (saleBarH > 0) {
+                    g2.setColor(new Color(34, 197, 94));
+                    g2.fillRect(saleX, saleY, barWidth, saleBarH);
+                }
+
+                // Cột cho thuê (Xanh dương)
+                if (rentBarH > 0) {
+                    g2.setColor(new Color(59, 130, 246));
+                    g2.fillRect(rentX, rentY, barWidth, rentBarH);
+                }
+
+                // Nhãn ngày tháng trục X
+                g2.setColor(UIUtils.COLOR_TEXT_MUTED);
+                g2.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+                FontMetrics fm = g2.getFontMetrics();
+                String lbl = pt.getDateLabel();
+
+                // Chỉ vẽ nhãn nếu không bị chồng chéo
+                int skip = Math.max(1, n / 12);
+                if (i % skip == 0 || i == n - 1) {
+                    g2.drawString(lbl, slotCenterX - fm.stringWidth(lbl) / 2, padTop + plotH + 16);
+                }
+            }
+
+            g2.dispose();
         }
     }
 }

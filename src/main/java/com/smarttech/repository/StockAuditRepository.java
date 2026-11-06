@@ -24,7 +24,7 @@ public class StockAuditRepository {
 
     public StockAuditRepository() {
         // ĐÃ SỬA: Đổi "import_orders" thành "stock_audits"
-        this.collection = MongoDBConnection.getInstance().getCollection("stock_audits");
+        this.collection = MongoDBConnection.getDatabase().getCollection("stock_audits");
     }
 
     public List<StockAudit> findAll() {

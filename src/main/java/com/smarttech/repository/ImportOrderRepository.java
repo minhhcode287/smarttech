@@ -23,7 +23,7 @@ public class ImportOrderRepository {
     private final MongoCollection<Document> collection;
 
     public ImportOrderRepository() {
-        this.collection = MongoDBConnection.getInstance().getCollection("import_orders");
+        this.collection = MongoDBConnection.getDatabase().getCollection("import_orders");
     }
 
     public List<ImportOrder> findAll() {
